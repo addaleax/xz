@@ -134,12 +134,25 @@ xz_ver_to_str(uint32_t ver)
 	return buf;
 }
 
+typedef struct {
+
+	/// Combined Index of all Streams in the file
+	lzma_index *index;
+
+	/// Total amount of Stream Padding
+	uint64_t stream_padding;
+
+} lzma_file_info;
+
+typedef int (*parse_indexes_read_callback)(void *opaque, uint8_t *buf, size_t count, off_t offset);
 
 /// \brief      Parse the Index(es) from the given .xz file
 ///
-/// \param      xfi     Pointer to structure where the decoded information
-///                     is stored.
-/// \param      pair    Input file
+/// \param      lfi      Pointer to structure where the decoded information
+///                      is stored.
+/// \param      opaque   Input file opaque pointer
+/// \param      filename Input file name
+/// \param      size     Input file size
 ///
 /// \return     On success, false is returned. On error, true is returned.
 ///
@@ -147,20 +160,20 @@ xz_ver_to_str(uint32_t ver)
 // takes a callback function to parse the Index(es) from a .xz file to make
 // it easy for applications.
 static bool
-parse_indexes(xz_file_info *xfi, file_pair *pair)
+parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t size, parse_indexes_read_callback read_callback)
 {
-	if (pair->src_st.st_size <= 0) {
-		message_error(_("%s: File is empty"), pair->src_name);
+	if (size <= 0) {
+		message_error(_("%s: File is empty"), filename);
 		return true;
 	}
 
-	if (pair->src_st.st_size < 2 * LZMA_STREAM_HEADER_SIZE) {
+	if (size < 2 * LZMA_STREAM_HEADER_SIZE) {
 		message_error(_("%s: Too small to be a valid .xz file"),
-				pair->src_name);
+				filename);
 		return true;
 	}
 
-	io_buf buf;
+	uint8_t buf[8192];
 	lzma_stream_flags header_flags;
 	lzma_stream_flags footer_flags;
 	lzma_ret ret;
@@ -176,7 +189,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 
 	// Current position in the file. We parse the file backwards so
 	// initialize it to point to the end of the file.
-	off_t pos = pair->src_st.st_size;
+	off_t pos = size;
 
 	// Each loop iteration decodes one Index.
 	do {
@@ -184,7 +197,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// the Stream Header and Stream Footer. This check cannot
 		// fail in the first pass of this loop.
 		if (pos < 2 * LZMA_STREAM_HEADER_SIZE) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(LZMA_DATA_ERROR));
 			goto error;
 		}
@@ -196,36 +209,37 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// we must skip when reading backwards.
 		while (true) {
 			if (pos < LZMA_STREAM_HEADER_SIZE) {
-				message_error("%s: %s", pair->src_name,
+				message_error("%s: %s", filename,
 						message_strm(
 							LZMA_DATA_ERROR));
 				goto error;
 			}
 
-			if (io_pread(pair, &buf,
+			if (read_callback(opaque, buf,
 					LZMA_STREAM_HEADER_SIZE, pos))
 				goto error;
 
 			// Stream Padding is always a multiple of four bytes.
 			int i = 2;
-			if (buf.u32[i] != 0)
+			if (((uint32_t*)buf)[i] != 0)
 				break;
 
-			// To avoid calling io_pread() for every four bytes
-			// of Stream Padding, take advantage that we read
-			// 12 bytes (LZMA_STREAM_HEADER_SIZE) already and
-			// check them too before calling io_pread() again.
+			// To avoid calling the read callback for every four
+			// bytes of Stream Padding, take advantage that we
+			// read 12 bytes (LZMA_STREAM_HEADER_SIZE) already
+			// and check them too before calling the read
+			// callback again.
 			do {
 				stream_padding += 4;
 				pos -= 4;
 				--i;
-			} while (i >= 0 && buf.u32[i] == 0);
+			} while (i >= 0 && ((uint32_t*)buf)[i] == 0);
 		}
 
 		// Decode the Stream Footer.
-		ret = lzma_stream_footer_decode(&footer_flags, buf.u8);
+		ret = lzma_stream_footer_decode(&footer_flags, buf);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(ret));
 			goto error;
 		}
@@ -239,7 +253,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// match when it is compared against Stream Footer with
 		// lzma_stream_flags_compare().
 		if (footer_flags.version != 0) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(LZMA_OPTIONS_ERROR));
 			goto error;
 		}
@@ -247,7 +261,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// Check that the size of the Index field looks sane.
 		lzma_vli index_size = footer_flags.backward_size;
 		if ((lzma_vli)(pos) < index_size + LZMA_STREAM_HEADER_SIZE) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(LZMA_DATA_ERROR));
 			goto error;
 		}
@@ -269,7 +283,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// Decode the Index.
 		ret = lzma_index_decoder(&strm, &this_index, memlimit);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(ret));
 			goto error;
 		}
@@ -278,13 +292,13 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 			// Don't give the decoder more input than the
 			// Index size.
 			strm.avail_in = my_min(IO_BUFFER_SIZE, index_size);
-			if (io_pread(pair, &buf, strm.avail_in, pos))
+			if (read_callback(opaque, buf, strm.avail_in, pos))
 				goto error;
 
 			pos += strm.avail_in;
 			index_size -= strm.avail_in;
 
-			strm.next_in = buf.u8;
+			strm.next_in = buf;
 			ret = lzma_code(&strm, LZMA_RUN);
 
 		} while (ret == LZMA_OK);
@@ -305,7 +319,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 			if (ret == LZMA_BUF_ERROR)
 				ret = LZMA_DATA_ERROR;
 
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(ret));
 
 			// If the error was too low memory usage limit,
@@ -327,25 +341,25 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		// match the Stream Footer.
 		pos -= footer_flags.backward_size + LZMA_STREAM_HEADER_SIZE;
 		if ((lzma_vli)(pos) < lzma_index_total_size(this_index)) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(LZMA_DATA_ERROR));
 			goto error;
 		}
 
 		pos -= lzma_index_total_size(this_index);
-		if (io_pread(pair, &buf, LZMA_STREAM_HEADER_SIZE, pos))
+		if (read_callback(opaque, buf, LZMA_STREAM_HEADER_SIZE, pos))
 			goto error;
 
-		ret = lzma_stream_header_decode(&header_flags, buf.u8);
+		ret = lzma_stream_header_decode(&header_flags, buf);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(ret));
 			goto error;
 		}
 
 		ret = lzma_stream_flags_compare(&header_flags, &footer_flags);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", pair->src_name,
+			message_error("%s: %s", filename,
 					message_strm(ret));
 			goto error;
 		}
@@ -369,7 +383,7 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 			ret = lzma_index_cat(
 					this_index, combined_index, NULL);
 			if (ret != LZMA_OK) {
-				message_error("%s: %s", pair->src_name,
+				message_error("%s: %s", filename,
 						message_strm(ret));
 				goto error;
 			}
@@ -378,14 +392,14 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		combined_index = this_index;
 		this_index = NULL;
 
-		xfi->stream_padding += stream_padding;
+		lfi->stream_padding += stream_padding;
 
 	} while (pos > 0);
 
 	lzma_end(&strm);
 
 	// All OK. Make combined_index available to the caller.
-	xfi->idx = combined_index;
+	lfi->index = combined_index;
 	return false;
 
 error:
@@ -1132,6 +1146,9 @@ list_totals(void)
 	return;
 }
 
+static int read_buffer(void *pair, uint8_t *buf, size_t count, off_t offset) {
+	return io_pread((file_pair *)pair, (io_buf *)buf, count, offset);
+}
 
 extern void
 list_file(const char *filename)
@@ -1156,9 +1173,13 @@ list_file(const char *filename)
 	if (pair == NULL)
 		return;
 
-	xz_file_info xfi = XZ_FILE_INFO_INIT;
-	if (!parse_indexes(&xfi, pair)) {
+	lzma_file_info lfi = { NULL, 0 };
+	if (!parse_indexes(&lfi, pair, pair->src_name, pair->src_st.st_size, read_buffer)) {
 		bool fail;
+
+		xz_file_info xfi = XZ_FILE_INFO_INIT;
+		xfi.idx = lfi.index;
+		xfi.stream_padding = lfi.stream_padding;
 
 		// We have three main modes:
 		//  - --robot, which has submodes if --verbose is specified
