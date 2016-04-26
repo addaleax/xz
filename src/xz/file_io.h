@@ -140,9 +140,9 @@ extern void io_fix_src_pos(file_pair *pair, size_t rewind_size);
 /// \param      pos     Offset relative to the beginning of the file,
 ///                     from which the data should be read.
 ///
-/// \return     On success, false is returned. On error, error message
-///             is printed and true is returned.
-extern bool io_pread(file_pair *pair, io_buf *buf, size_t size, off_t pos);
+/// \return     On success, the number of read bytes is returned. On error,
+///             error message is printed and -1 is returned.
+extern ssize_t io_pread(file_pair *pair, io_buf *buf, size_t size, off_t pos);
 
 
 /// \brief      Writes a buffer to the destination file

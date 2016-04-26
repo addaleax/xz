@@ -145,10 +145,10 @@ typedef struct {
 	size_t stream_padding;
 
 	/// Callback for reading data at a given position in the input file
-	int (*LZMA_API_CALL read_callback)(void *opaque,
-	                                   uint8_t *buf,
-	                                   size_t count,
-	                                   off_t offset);
+	ssize_t (*LZMA_API_CALL read_callback)(void *opaque,
+	                                       uint8_t *buf,
+	                                       size_t count,
+	                                       off_t offset);
 
 	/// Opaque pointer that is passed to read_callback.
 	void *opaque;
@@ -168,6 +168,27 @@ typedef struct {
 
 #define LZMA_INDEX_PARSER_DATA_INIT \
 	{ NULL, 0, NULL, NULL, 0, NULL, NULL, NULL }
+
+static lzma_ret
+parse_indexes_read(lzma_index_parser_data *info,
+                   uint8_t *buf,
+                   size_t size,
+                   off_t pos)
+{
+	ssize_t read = info->read_callback(info->opaque, buf, size, pos);
+
+	if (read < 0) {
+		info->message = strerror(errno);
+		return LZMA_DATA_ERROR;
+	}
+
+	if ((size_t)read != size) {
+		info->message = "Unexpected end of file";
+		return LZMA_DATA_ERROR;
+	}
+
+	return LZMA_OK;
+}
 
 // TODO: update comment
 /// \brief      Parse the Index(es) from the given .xz file
@@ -238,9 +259,8 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 				goto error;
 			}
 
-			// XXX RETURN VALUE????
-			if (info->read_callback(info->opaque, buf,
-					LZMA_STREAM_HEADER_SIZE, pos))
+			ret = parse_indexes_read(info, buf, LZMA_STREAM_HEADER_SIZE, pos);
+			if (ret != LZMA_OK)
 				goto error;
 
 			// Stream Padding is always a multiple of four bytes.
@@ -310,8 +330,10 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 			// Don't give the decoder more input than the
 			// Index size.
 			strm.avail_in = my_min(IO_BUFFER_SIZE, index_size);
-			if (info->read_callback(info->opaque, buf, strm.avail_in, pos))
+			ret = parse_indexes_read(info, buf, strm.avail_in, pos);
+			if (ret != LZMA_OK)
 				goto error;
+
 
 			pos += strm.avail_in;
 			index_size -= strm.avail_in;
@@ -361,7 +383,8 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		}
 
 		pos -= lzma_index_total_size(this_index);
-		if (info->read_callback(info->opaque, buf, LZMA_STREAM_HEADER_SIZE, pos))
+		ret = parse_indexes_read(info, buf, LZMA_STREAM_HEADER_SIZE, pos);
+		if (ret != LZMA_OK)
 			goto error;
 
 		ret = lzma_stream_header_decode(&header_flags, buf);
@@ -1154,9 +1177,17 @@ list_totals(void)
 	return;
 }
 
-// XXX return value?
-static int read_buffer(void *pair, uint8_t *buf, size_t count, off_t offset) {
-	return io_pread((file_pair *)pair, (io_buf *)buf, count, offset);
+static bool io_failure = false;
+static ssize_t read_buffer(void *pair, uint8_t *buf, size_t count, off_t offset) {
+	ssize_t amount = io_pread((file_pair *)pair, (io_buf *)buf, count, offset);
+
+	if (amount == -1) {
+		// Save this information so list_file() knows it doesn't have to do
+		// error handling on its own.
+		io_failure = true;
+	}
+
+	return amount;
 }
 
 extern void
@@ -1186,10 +1217,15 @@ list_file(const char *filename)
 	index_info.opaque = pair;
 	index_info.read_callback = read_buffer;
 	index_info.file_size = pair->src_st.st_size;
+	io_failure = false;
+
 	lzma_ret ret = lzma_parse_indexes_from_file(&index_info);
 	if (ret != LZMA_OK) {
-		message_error("%s: %s", filename,
-				index_info.message ? _(index_info.message) : message_strm(ret));
+		// If io_pread failed, then there has already been an error message.
+		if (!io_failure) {
+			message_error("%s: %s", filename,
+					index_info.message ? _(index_info.message) : message_strm(ret));
+		}
 	} else {
 		bool fail;
 

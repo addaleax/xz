@@ -1136,7 +1136,7 @@ io_read(file_pair *pair, io_buf *buf_union, size_t size)
 }
 
 
-extern bool
+extern ssize_t
 io_pread(file_pair *pair, io_buf *buf, size_t size, off_t pos)
 {
 	// Using lseek() and read() is more portable than pread() and
@@ -1144,20 +1144,20 @@ io_pread(file_pair *pair, io_buf *buf, size_t size, off_t pos)
 	if (lseek(pair->src_fd, pos, SEEK_SET) != pos) {
 		message_error(_("%s: Error seeking the file: %s"),
 				pair->src_name, strerror(errno));
-		return true;
+		return -1;
 	}
 
 	const size_t amount = io_read(pair, buf, size);
 	if (amount == SIZE_MAX)
-		return true;
+		return -1;
 
 	if (amount != size) {
 		message_error(_("%s: Unexpected end of file"),
 				pair->src_name);
-		return true;
+		return -1;
 	}
 
-	return false;
+	return amount;
 }
 
 
