@@ -135,17 +135,41 @@ xz_ver_to_str(uint32_t ver)
 }
 
 typedef struct {
+} lzma_index_parser_internal;
 
+typedef struct {
 	/// Combined Index of all Streams in the file
 	lzma_index *index;
 
 	/// Total amount of Stream Padding
-	uint64_t stream_padding;
+	size_t stream_padding;
 
-} lzma_file_info;
+	/// Callback for reading data at a given position in the input file
+	int (*LZMA_API_CALL read_callback)(void *opaque,
+	                                   uint8_t *buf,
+	                                   size_t count,
+	                                   off_t offset);
 
-typedef int (*parse_indexes_read_callback)(void *opaque, uint8_t *buf, size_t count, off_t offset);
+	/// Opaque pointer that is passed to read_callback.
+	void *opaque;
 
+	/// Input file size.
+	size_t file_size;
+
+	/// Message that may be set when additional information is available on error.
+	const char* message;
+
+	/// Allocator used for internal data.
+	const lzma_allocator *allocator;
+
+	/// Data which is internal to the index parser.
+	lzma_index_parser_internal* internal;
+} lzma_index_parser_data;
+
+#define LZMA_INDEX_PARSER_DATA_INIT \
+	{ NULL, 0, NULL, NULL, 0, NULL, NULL, NULL }
+
+// TODO: update comment
 /// \brief      Parse the Index(es) from the given .xz file
 ///
 /// \param      lfi      Pointer to structure where the decoded information
@@ -159,18 +183,18 @@ typedef int (*parse_indexes_read_callback)(void *opaque, uint8_t *buf, size_t co
 // TODO: This function is pretty big. liblzma should have a function that
 // takes a callback function to parse the Index(es) from a .xz file to make
 // it easy for applications.
-static bool
-parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t size, parse_indexes_read_callback read_callback)
+static lzma_ret
+lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 {
-	if (size <= 0) {
-		message_error(_("%s: File is empty"), filename);
-		return true;
+	info->message = NULL;
+	if (info->file_size <= 0) {
+		info->message = "File is empty";
+		return LZMA_DATA_ERROR;
 	}
 
-	if (size < 2 * LZMA_STREAM_HEADER_SIZE) {
-		message_error(_("%s: Too small to be a valid .xz file"),
-				filename);
-		return true;
+	if (info->file_size < 2 * LZMA_STREAM_HEADER_SIZE) {
+		info->message = "Too small to be a valid .xz file";
+		return LZMA_DATA_ERROR;
 	}
 
 	uint8_t buf[8192];
@@ -189,7 +213,7 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 
 	// Current position in the file. We parse the file backwards so
 	// initialize it to point to the end of the file.
-	off_t pos = size;
+	off_t pos = info->file_size;
 
 	// Each loop iteration decodes one Index.
 	do {
@@ -197,8 +221,7 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// the Stream Header and Stream Footer. This check cannot
 		// fail in the first pass of this loop.
 		if (pos < 2 * LZMA_STREAM_HEADER_SIZE) {
-			message_error("%s: %s", filename,
-					message_strm(LZMA_DATA_ERROR));
+			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
@@ -209,13 +232,12 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// we must skip when reading backwards.
 		while (true) {
 			if (pos < LZMA_STREAM_HEADER_SIZE) {
-				message_error("%s: %s", filename,
-						message_strm(
-							LZMA_DATA_ERROR));
+				ret = LZMA_DATA_ERROR;
 				goto error;
 			}
 
-			if (read_callback(opaque, buf,
+			// XXX RETURN VALUE????
+			if (info->read_callback(info->opaque, buf,
 					LZMA_STREAM_HEADER_SIZE, pos))
 				goto error;
 
@@ -239,8 +261,6 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// Decode the Stream Footer.
 		ret = lzma_stream_footer_decode(&footer_flags, buf);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", filename,
-					message_strm(ret));
 			goto error;
 		}
 
@@ -253,16 +273,14 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// match when it is compared against Stream Footer with
 		// lzma_stream_flags_compare().
 		if (footer_flags.version != 0) {
-			message_error("%s: %s", filename,
-					message_strm(LZMA_OPTIONS_ERROR));
+			ret = LZMA_OPTIONS_ERROR;
 			goto error;
 		}
 
 		// Check that the size of the Index field looks sane.
 		lzma_vli index_size = footer_flags.backward_size;
 		if ((lzma_vli)(pos) < index_size + LZMA_STREAM_HEADER_SIZE) {
-			message_error("%s: %s", filename,
-					message_strm(LZMA_DATA_ERROR));
+			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
@@ -283,8 +301,6 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// Decode the Index.
 		ret = lzma_index_decoder(&strm, &this_index, memlimit);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", filename,
-					message_strm(ret));
 			goto error;
 		}
 
@@ -292,7 +308,7 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 			// Don't give the decoder more input than the
 			// Index size.
 			strm.avail_in = my_min(IO_BUFFER_SIZE, index_size);
-			if (read_callback(opaque, buf, strm.avail_in, pos))
+			if (info->read_callback(info->opaque, buf, strm.avail_in, pos))
 				goto error;
 
 			pos += strm.avail_in;
@@ -319,9 +335,6 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 			if (ret == LZMA_BUF_ERROR)
 				ret = LZMA_DATA_ERROR;
 
-			message_error("%s: %s", filename,
-					message_strm(ret));
-
 			// If the error was too low memory usage limit,
 			// show also how much memory would have been needed.
 			if (ret == LZMA_MEMLIMIT_ERROR) {
@@ -341,26 +354,21 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		// match the Stream Footer.
 		pos -= footer_flags.backward_size + LZMA_STREAM_HEADER_SIZE;
 		if ((lzma_vli)(pos) < lzma_index_total_size(this_index)) {
-			message_error("%s: %s", filename,
-					message_strm(LZMA_DATA_ERROR));
+			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
 		pos -= lzma_index_total_size(this_index);
-		if (read_callback(opaque, buf, LZMA_STREAM_HEADER_SIZE, pos))
+		if (info->read_callback(info->opaque, buf, LZMA_STREAM_HEADER_SIZE, pos))
 			goto error;
 
 		ret = lzma_stream_header_decode(&header_flags, buf);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", filename,
-					message_strm(ret));
 			goto error;
 		}
 
 		ret = lzma_stream_flags_compare(&header_flags, &footer_flags);
 		if (ret != LZMA_OK) {
-			message_error("%s: %s", filename,
-					message_strm(ret));
 			goto error;
 		}
 
@@ -383,8 +391,6 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 			ret = lzma_index_cat(
 					this_index, combined_index, NULL);
 			if (ret != LZMA_OK) {
-				message_error("%s: %s", filename,
-						message_strm(ret));
 				goto error;
 			}
 		}
@@ -392,22 +398,22 @@ parse_indexes(lzma_file_info *lfi, void *opaque, const char *filename, size_t si
 		combined_index = this_index;
 		this_index = NULL;
 
-		lfi->stream_padding += stream_padding;
+		info->stream_padding += stream_padding;
 
 	} while (pos > 0);
 
 	lzma_end(&strm);
 
 	// All OK. Make combined_index available to the caller.
-	lfi->index = combined_index;
-	return false;
+	info->index = combined_index;
+	return LZMA_OK;
 
 error:
 	// Something went wrong, free the allocated memory.
 	lzma_end(&strm);
 	lzma_index_end(combined_index, NULL);
 	lzma_index_end(this_index, NULL);
-	return true;
+	return ret;
 }
 
 
@@ -1146,6 +1152,7 @@ list_totals(void)
 	return;
 }
 
+// XXX return value?
 static int read_buffer(void *pair, uint8_t *buf, size_t count, off_t offset) {
 	return io_pread((file_pair *)pair, (io_buf *)buf, count, offset);
 }
@@ -1173,13 +1180,20 @@ list_file(const char *filename)
 	if (pair == NULL)
 		return;
 
-	lzma_file_info lfi = { NULL, 0 };
-	if (!parse_indexes(&lfi, pair, pair->src_name, pair->src_st.st_size, read_buffer)) {
+	lzma_index_parser_data index_info = LZMA_INDEX_PARSER_DATA_INIT;
+	index_info.opaque = pair;
+	index_info.read_callback = read_buffer;
+	index_info.file_size = pair->src_st.st_size;
+	lzma_ret ret = lzma_parse_indexes_from_file(&index_info);
+	if (ret != LZMA_OK) {
+		message_error("%s: %s", filename,
+				index_info.message ? index_info.message : message_strm(ret));
+	} else {
 		bool fail;
 
 		xz_file_info xfi = XZ_FILE_INFO_INIT;
-		xfi.idx = lfi.index;
-		xfi.stream_padding = lfi.stream_padding;
+		xfi.idx = index_info.index;
+		xfi.stream_padding = index_info.stream_padding;
 
 		// We have three main modes:
 		//  - --robot, which has submodes if --verbose is specified
