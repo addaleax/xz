@@ -134,8 +134,76 @@ xz_ver_to_str(uint32_t ver)
 	return buf;
 }
 
-typedef struct {
-} lzma_index_parser_internal;
+/* Blatantly copied functions from liblzma */
+static void * lzma_attribute((__malloc__)) lzma_attr_alloc_size(1)
+lzma_alloc(size_t size, const lzma_allocator *allocator)
+{
+	// Some malloc() variants return NULL if called with size == 0.
+	if (size == 0)
+		size = 1;
+
+	void *ptr;
+
+	if (allocator != NULL && allocator->alloc != NULL)
+		ptr = allocator->alloc(allocator->opaque, 1, size);
+	else
+		ptr = malloc(size);
+
+	return ptr;
+}
+
+static void
+lzma_free(void *ptr, const lzma_allocator *allocator)
+{
+	if (allocator != NULL && allocator->free != NULL)
+		allocator->free(allocator->opaque, ptr);
+	else
+		free(ptr);
+
+	return;
+}
+/* End blatantly copied stuff */
+
+typedef struct lzma_index_parser_internal_s lzma_index_parser_internal;
+
+struct lzma_index_parser_internal_s {
+	/// Current state.
+	enum {
+		PARSE_INDEX_INITED,
+		PARSE_INDEX_READ_FOOTER,
+		PARSE_INDEX_READ_INDEX,
+		PARSE_INDEX_READ_STREAM_HEADER
+	} state;
+
+	/// Current position in the file. We parse the file backwards so
+	/// initialize it to point to the end of the file.
+	off_t pos;
+
+	/// The footer flags of the current XZ stream.
+	lzma_stream_flags footer_flags;
+
+	/// All Indexes decoded so far.
+	lzma_index *combined_index;
+
+	/// The Index currently being decoded.
+	lzma_index *this_index;
+
+	/// Padding of the stream currently being decoded.
+	lzma_vli stream_padding;
+
+	/// Size of the Index currently being decoded.
+	lzma_vli index_size;
+
+	/// Keep track of how much memory is being used for Index decoding.
+	uint64_t memused;
+
+	/// lzma_stream for the Index decoder.
+	lzma_stream strm;
+
+	/// Keep the buffer coming as the last member to so all data that is ever
+	/// actually used fits in a few cache lines.
+	uint8_t buf[8192];
+};
 
 typedef struct {
 	/// Combined Index of all Streams in the file
@@ -153,6 +221,9 @@ typedef struct {
 	/// Opaque pointer that is passed to read_callback.
 	void *opaque;
 
+	/// Whether to return after calling read_callback and wait for another call.
+	lzma_bool async;
+
 	/// Input file size.
 	size_t file_size;
 
@@ -167,7 +238,7 @@ typedef struct {
 } lzma_index_parser_data;
 
 #define LZMA_INDEX_PARSER_DATA_INIT \
-	{ NULL, 0, NULL, NULL, 0, NULL, NULL, NULL }
+	{ NULL, 0, NULL, NULL, 0, 0, NULL, NULL, NULL }
 
 static lzma_ret
 parse_indexes_read(lzma_index_parser_data *info,
@@ -207,7 +278,42 @@ parse_indexes_read(lzma_index_parser_data *info,
 static lzma_ret
 lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 {
+	lzma_ret ret;
+	lzma_index_parser_internal* internal = info->internal;
 	info->message = NULL;
+
+	// Passing file_size == SIZE_MAX can be used to safely clean up everything
+	// when I/O failed asynchronously.
+	if (info->file_size == SIZE_MAX) {
+		ret = LZMA_OPTIONS_ERROR;
+		goto error;
+	}
+
+	if (internal == NULL) {
+		internal = lzma_alloc(sizeof(lzma_index_parser_internal),
+			info->allocator);
+
+		if (internal == NULL)
+			return LZMA_MEM_ERROR;
+
+		internal->state = PARSE_INDEX_INITED;
+		internal->pos = info->file_size;
+		internal->combined_index = NULL;
+		internal->this_index = NULL;
+		info->internal = internal;
+
+		lzma_stream strm_ = LZMA_STREAM_INIT;
+		memcpy(&internal->strm, &strm_, sizeof(lzma_stream));
+	}
+
+	// The header flags of the current stream are only ever used within a call
+	// and don't need to go into the internals struct.
+	lzma_stream_flags header_flags;
+
+	int i;
+
+	switch (internal->state) {
+case PARSE_INDEX_INITED:
 	if (info->file_size <= 0) {
 		// These strings are fixed so they can be translated by the xz
 		// command line utility.
@@ -220,52 +326,37 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		return LZMA_DATA_ERROR;
 	}
 
-	uint8_t buf[8192];
-	lzma_stream_flags header_flags;
-	lzma_stream_flags footer_flags;
-	lzma_ret ret;
-
-	// lzma_stream for the Index decoder
-	lzma_stream strm = LZMA_STREAM_INIT;
-
-	// All Indexes decoded so far
-	lzma_index *combined_index = NULL;
-
-	// The Index currently being decoded
-	lzma_index *this_index = NULL;
-
-	// Current position in the file. We parse the file backwards so
-	// initialize it to point to the end of the file.
-	off_t pos = info->file_size;
-
 	// Each loop iteration decodes one Index.
 	do {
 		// Check that there is enough data left to contain at least
 		// the Stream Header and Stream Footer. This check cannot
 		// fail in the first pass of this loop.
-		if (pos < 2 * LZMA_STREAM_HEADER_SIZE) {
+		if (internal->pos < 2 * LZMA_STREAM_HEADER_SIZE) {
 			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
-		pos -= LZMA_STREAM_HEADER_SIZE;
-		lzma_vli stream_padding = 0;
+		internal->pos -= LZMA_STREAM_HEADER_SIZE;
+		internal->stream_padding = 0;
 
 		// Locate the Stream Footer. There may be Stream Padding which
 		// we must skip when reading backwards.
 		while (true) {
-			if (pos < LZMA_STREAM_HEADER_SIZE) {
+			if (internal->pos < LZMA_STREAM_HEADER_SIZE) {
 				ret = LZMA_DATA_ERROR;
 				goto error;
 			}
 
-			ret = parse_indexes_read(info, buf, LZMA_STREAM_HEADER_SIZE, pos);
+			ret = parse_indexes_read(info, internal->buf, LZMA_STREAM_HEADER_SIZE, internal->pos);
 			if (ret != LZMA_OK)
 				goto error;
+			internal->state = PARSE_INDEX_READ_FOOTER;
+			if (info->async) return LZMA_OK;
+case PARSE_INDEX_READ_FOOTER:
 
 			// Stream Padding is always a multiple of four bytes.
-			int i = 2;
-			if (((uint32_t*)buf)[i] != 0)
+			i = 2;
+			if (((uint32_t*)internal->buf)[i] != 0)
 				break;
 
 			// To avoid calling the read callback for every four
@@ -274,14 +365,14 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 			// and check them too before calling the read
 			// callback again.
 			do {
-				stream_padding += 4;
-				pos -= 4;
+				internal->stream_padding += 4;
+				internal->pos -= 4;
 				--i;
-			} while (i >= 0 && ((uint32_t*)buf)[i] == 0);
+			} while (i >= 0 && ((uint32_t*)internal->buf)[i] == 0);
 		}
 
 		// Decode the Stream Footer.
-		ret = lzma_stream_footer_decode(&footer_flags, buf);
+		ret = lzma_stream_footer_decode(&internal->footer_flags, internal->buf);
 		if (ret != LZMA_OK) {
 			goto error;
 		}
@@ -294,34 +385,34 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		// It is enough to check Stream Footer. Stream Header must
 		// match when it is compared against Stream Footer with
 		// lzma_stream_flags_compare().
-		if (footer_flags.version != 0) {
+		if (internal->footer_flags.version != 0) {
 			ret = LZMA_OPTIONS_ERROR;
 			goto error;
 		}
 
 		// Check that the size of the Index field looks sane.
-		lzma_vli index_size = footer_flags.backward_size;
-		if ((lzma_vli)(pos) < index_size + LZMA_STREAM_HEADER_SIZE) {
+		internal->index_size = internal->footer_flags.backward_size;
+		if ((lzma_vli)(internal->pos) < internal->index_size + LZMA_STREAM_HEADER_SIZE) {
 			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
 		// Set pos to the beginning of the Index.
-		pos -= index_size;
+		internal->pos -= internal->index_size;
 
 		// See how much memory we can use for decoding this Index.
 		uint64_t memlimit = hardware_memlimit_get(MODE_LIST);
-		uint64_t memused = 0;
-		if (combined_index != NULL) {
-			memused = lzma_index_memused(combined_index);
-			if (memused > memlimit)
+		internal->memused = 0;
+		if (internal->combined_index != NULL) {
+			internal->memused = lzma_index_memused(internal->combined_index);
+			if (internal->memused > memlimit)
 				message_bug();
 
-			memlimit -= memused;
+			memlimit -= internal->memused;
 		}
 
 		// Decode the Index.
-		ret = lzma_index_decoder(&strm, &this_index, memlimit);
+		ret = lzma_index_decoder(&internal->strm, &internal->this_index, memlimit);
 		if (ret != LZMA_OK) {
 			goto error;
 		}
@@ -329,17 +420,20 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		do {
 			// Don't give the decoder more input than the
 			// Index size.
-			strm.avail_in = my_min(IO_BUFFER_SIZE, index_size);
-			ret = parse_indexes_read(info, buf, strm.avail_in, pos);
+			internal->strm.avail_in = my_min(sizeof(internal->buf), internal->index_size);
+			ret = parse_indexes_read(info, internal->buf, internal->strm.avail_in, internal->pos);
 			if (ret != LZMA_OK)
 				goto error;
+			internal->state = PARSE_INDEX_READ_INDEX;
+			if (info->async) return LZMA_OK;
+case PARSE_INDEX_READ_INDEX:
 
 
-			pos += strm.avail_in;
-			index_size -= strm.avail_in;
+			internal->pos += internal->strm.avail_in;
+			internal->index_size -= internal->strm.avail_in;
 
-			strm.next_in = buf;
-			ret = lzma_code(&strm, LZMA_RUN);
+			internal->strm.next_in = internal->buf;
+			ret = lzma_code(&internal->strm, LZMA_RUN);
 
 		} while (ret == LZMA_OK);
 
@@ -347,7 +441,7 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		// the Index decoder consumed as much input as indicated
 		// by the Backward Size field.
 		if (ret == LZMA_STREAM_END)
-			if (index_size != 0 || strm.avail_in != 0)
+			if (internal->index_size != 0 || internal->strm.avail_in != 0)
 				ret = LZMA_DATA_ERROR;
 
 		if (ret != LZMA_STREAM_END) {
@@ -362,11 +456,11 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 			// If the error was too low memory usage limit,
 			// show also how much memory would have been needed.
 			if (ret == LZMA_MEMLIMIT_ERROR) {
-				uint64_t needed = lzma_memusage(&strm);
-				if (UINT64_MAX - needed < memused)
+				uint64_t needed = lzma_memusage(&internal->strm);
+				if (UINT64_MAX - needed < internal->memused)
 					needed = UINT64_MAX;
 				else
-					needed += memused;
+					needed += internal->memused;
 
 				message_mem_needed(V_ERROR, needed);
 			}
@@ -376,23 +470,27 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 
 		// Decode the Stream Header and check that its Stream Flags
 		// match the Stream Footer.
-		pos -= footer_flags.backward_size + LZMA_STREAM_HEADER_SIZE;
-		if ((lzma_vli)(pos) < lzma_index_total_size(this_index)) {
+		internal->pos -= internal->footer_flags.backward_size + LZMA_STREAM_HEADER_SIZE;
+		if ((lzma_vli)(internal->pos) < lzma_index_total_size(internal->this_index)) {
 			ret = LZMA_DATA_ERROR;
 			goto error;
 		}
 
-		pos -= lzma_index_total_size(this_index);
-		ret = parse_indexes_read(info, buf, LZMA_STREAM_HEADER_SIZE, pos);
+		internal->pos -= lzma_index_total_size(internal->this_index);
+		ret = parse_indexes_read(info, internal->buf, LZMA_STREAM_HEADER_SIZE, internal->pos);
 		if (ret != LZMA_OK)
 			goto error;
 
-		ret = lzma_stream_header_decode(&header_flags, buf);
+		internal->state = PARSE_INDEX_READ_STREAM_HEADER;
+		if (info->async) return LZMA_OK;
+case PARSE_INDEX_READ_STREAM_HEADER:
+
+		ret = lzma_stream_header_decode(&header_flags, internal->buf);
 		if (ret != LZMA_OK) {
 			goto error;
 		}
 
-		ret = lzma_stream_flags_compare(&header_flags, &footer_flags);
+		ret = lzma_stream_flags_compare(&header_flags, &internal->footer_flags);
 		if (ret != LZMA_OK) {
 			goto error;
 		}
@@ -400,44 +498,53 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 		// Store the decoded Stream Flags into this_index. This is
 		// needed so that we can print which Check is used in each
 		// Stream.
-		ret = lzma_index_stream_flags(this_index, &footer_flags);
+		ret = lzma_index_stream_flags(internal->this_index, &internal->footer_flags);
 		if (ret != LZMA_OK)
 			message_bug();
 
 		// Store also the size of the Stream Padding field. It is
 		// needed to show the offsets of the Streams correctly.
-		ret = lzma_index_stream_padding(this_index, stream_padding);
+		ret = lzma_index_stream_padding(internal->this_index, internal->stream_padding);
 		if (ret != LZMA_OK)
 			message_bug();
 
-		if (combined_index != NULL) {
+		if (internal->combined_index != NULL) {
 			// Append the earlier decoded Indexes
 			// after this_index.
 			ret = lzma_index_cat(
-					this_index, combined_index, NULL);
+					internal->this_index, internal->combined_index, NULL);
 			if (ret != LZMA_OK) {
 				goto error;
 			}
 		}
 
-		combined_index = this_index;
-		this_index = NULL;
+		internal->combined_index = internal->this_index;
+		internal->this_index = NULL;
 
-		info->stream_padding += stream_padding;
+		info->stream_padding += internal->stream_padding;
 
-	} while (pos > 0);
+	} while (internal->pos > 0);
 
-	lzma_end(&strm);
+	lzma_end(&internal->strm);
 
 	// All OK. Make combined_index available to the caller.
-	info->index = combined_index;
-	return LZMA_OK;
+	info->index = internal->combined_index;
+
+	lzma_free(internal, info->allocator);
+	info->internal = NULL;
+	return LZMA_STREAM_END;
+} // end switch(internal->state)
 
 error:
 	// Something went wrong, free the allocated memory.
-	lzma_end(&strm);
-	lzma_index_end(combined_index, NULL);
-	lzma_index_end(this_index, NULL);
+	if (internal) {
+		lzma_end(&internal->strm);
+		lzma_index_end(internal->combined_index, NULL);
+		lzma_index_end(internal->this_index, NULL);
+		lzma_free(internal, info->allocator);
+	}
+
+	info->internal = NULL;
 	return ret;
 }
 
@@ -1220,7 +1327,7 @@ list_file(const char *filename)
 	io_failure = false;
 
 	lzma_ret ret = lzma_parse_indexes_from_file(&index_info);
-	if (ret != LZMA_OK) {
+	if (ret != LZMA_STREAM_END) {
 		// If io_pread failed, then there has already been an error message.
 		if (!io_failure) {
 			message_error("%s: %s", filename,
