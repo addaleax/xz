@@ -321,14 +321,12 @@ msgid "Unknown-15"
 msgstr "Unbek.15"
 
 #: src/xz/list.c:153
-#, c-format
-msgid "%s: File is empty"
-msgstr "%s: Datei ist leer"
+msgid "File is empty"
+msgstr "Datei ist leer"
 
 #: src/xz/list.c:158
-#, c-format
-msgid "%s: Too small to be a valid .xz file"
-msgstr "%s: Zu klein um eine gültige .xz-Datei zu sein"
+msgid "Too small to be a valid .xz file"
+msgstr "Zu klein um eine gültige .xz-Datei zu sein"
 
 #. TRANSLATORS: These are column headings. From Strms (Streams)
 #. to Ratio, the columns are right aligned. Check and Filename

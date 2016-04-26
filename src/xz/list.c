@@ -188,6 +188,8 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 {
 	info->message = NULL;
 	if (info->file_size <= 0) {
+		// These strings are fixed so they can be translated by the xz
+		// command line utility.
 		info->message = "File is empty";
 		return LZMA_DATA_ERROR;
 	}
@@ -1187,7 +1189,7 @@ list_file(const char *filename)
 	lzma_ret ret = lzma_parse_indexes_from_file(&index_info);
 	if (ret != LZMA_OK) {
 		message_error("%s: %s", filename,
-				index_info.message ? index_info.message : message_strm(ret));
+				index_info.message ? _(index_info.message) : message_strm(ret));
 	} else {
 		bool fail;
 
