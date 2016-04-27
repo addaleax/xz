@@ -680,3 +680,59 @@ extern LZMA_API(lzma_ret) lzma_index_buffer_decode(lzma_index **i,
 		uint64_t *memlimit, const lzma_allocator *allocator,
 		const uint8_t *in, size_t *in_pos, size_t in_size)
 		lzma_nothrow;
+
+typedef struct lzma_index_parser_internal_s lzma_index_parser_internal;
+
+typedef struct {
+	/// Combined Index of all Streams in the file
+	lzma_index *index;
+
+	/// Total amount of Stream Padding
+	size_t stream_padding;
+
+	/// Callback for reading data at a given position in the input file
+	ssize_t (*LZMA_API_CALL read_callback)(void *opaque,
+	                                       uint8_t *buf,
+	                                       size_t count,
+	                                       off_t offset);
+
+	/// Opaque pointer that is passed to read_callback.
+	void *opaque;
+
+	/// Whether to return after calling read_callback and wait for
+	/// another call.
+	lzma_bool async;
+
+	/// Input file size.
+	size_t file_size;
+
+	/// Memory limit for decoding the indexes.
+	uint64_t memlimit;
+
+	/// Message that may be set when additional information is available
+	/// on error.
+	const char* message;
+
+	/// Allocator used for internal data.
+	const lzma_allocator *allocator;
+
+	/// Data which is internal to the index parser.
+	lzma_index_parser_internal* internal;
+} lzma_index_parser_data;
+
+#define LZMA_INDEX_PARSER_DATA_INIT \
+	{ NULL, 0, NULL, NULL, 0, 0, 0, NULL, NULL, NULL }
+
+// TODO: update comment
+/// \brief      Parse the Index(es) from the given .xz file
+///
+/// \param      lfi      Pointer to structure where the decoded information
+///                      is stored.
+/// \param      opaque   Input file opaque pointer
+/// \param      filename Input file name
+/// \param      size     Input file size
+///
+/// \return     On success, false is returned. On error, true is returned.
+///
+extern LZMA_API(lzma_ret)
+lzma_parse_indexes_from_file(lzma_index_parser_data *info) lzma_nothrow;

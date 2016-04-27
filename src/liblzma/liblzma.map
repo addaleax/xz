@@ -102,6 +102,7 @@ global:
 	lzma_get_progress;
 	lzma_stream_encoder_mt;
 	lzma_stream_encoder_mt_memusage;
+	lzma_parse_indexes_from_file;
 
 local:
 	*;
