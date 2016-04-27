@@ -407,7 +407,7 @@ extern LZMA_API(lzma_ret)
 lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 {
 	lzma_ret ret;
-	lzma_index_parser_internal* internal = info->internal;
+	lzma_index_parser_internal *internal = info->internal;
 	info->message = NULL;
 
 	// Passing file_size == SIZE_MAX can be used to safely clean up
@@ -500,7 +500,7 @@ case PARSE_INDEX_READ_FOOTER:
 
 			// Stream Padding is always a multiple of four bytes.
 			i = 2;
-			if (((uint32_t*)internal->buf)[i] != 0)
+			if (((uint32_t *)internal->buf)[i] != 0)
 				break;
 
 			// To avoid calling the read callback for every four
@@ -512,7 +512,7 @@ case PARSE_INDEX_READ_FOOTER:
 				internal->stream_padding += 4;
 				internal->pos -= 4;
 				--i;
-			} while (i >= 0 && ((uint32_t*)internal->buf)[i] == 0);
+			} while (i >= 0 && ((uint32_t *)internal->buf)[i] == 0);
 		}
 
 		// Decode the Stream Footer.
@@ -712,5 +712,9 @@ error:
 	}
 
 	info->internal = NULL;
+
+	// Doing this will prevent people from calling lzma_parse_indexes_from_file()
+	// again without re-initializing.
+	info->file_size = SIZE_MAX;
 	return ret;
 }
