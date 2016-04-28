@@ -763,10 +763,10 @@ typedef struct {
 	 * This function is modelled after pread(2), which is a available on
 	 * some platforms and can be easily wrapped to be used here.
 	 */
-	ssize_t (*LZMA_API_CALL read_callback)(void *opaque,
+	int64_t (LZMA_API_CALL *read_callback)(void *opaque,
 	                                       uint8_t *buf,
 	                                       size_t count,
-	                                       off_t offset);
+	                                       int64_t offset);
 
 	/// Opaque pointer that is passed to read_callback.
 	void *opaque;

@@ -355,7 +355,7 @@ struct lzma_index_parser_internal_s {
 
 	/// Current position in the file. We parse the file backwards so
 	/// initialize it to point to the end of the file.
-	off_t pos;
+	int64_t pos;
 
 	/// The footer flags of the current XZ stream.
 	lzma_stream_flags footer_flags;
@@ -387,9 +387,9 @@ static lzma_ret
 parse_indexes_read(lzma_index_parser_data *info,
                    uint8_t *buf,
                    size_t size,
-                   off_t pos)
+                   int64_t pos)
 {
-	ssize_t read = info->read_callback(info->opaque, buf, size, pos);
+	int64_t read = info->read_callback(info->opaque, buf, size, pos);
 
 	if (read < 0) {
 		return LZMA_DATA_ERROR;
@@ -409,6 +409,12 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 	lzma_ret ret;
 	lzma_index_parser_internal *internal = info->internal;
 	info->message = NULL;
+
+	// Apparently, we are already done.
+	if (info->index != NULL) {
+		ret = LZMA_PROG_ERROR;
+		goto error;
+	}
 
 	// Passing file_size == SIZE_MAX can be used to safely clean up
 	// everything when I/O failed asynchronously.
@@ -444,6 +450,7 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 
 		lzma_stream strm_ = LZMA_STREAM_INIT;
 		memcpy(&internal->strm, &strm_, sizeof(lzma_stream));
+		internal->strm.allocator = info->allocator;
 	}
 
 	// The header flags of the current stream are only ever used within a
@@ -451,6 +458,7 @@ lzma_parse_indexes_from_file(lzma_index_parser_data *info)
 	lzma_stream_flags header_flags;
 
 	int i;
+	uint64_t memlimit;
 
 	switch (internal->state) {
 case PARSE_INDEX_INITED:
@@ -548,7 +556,7 @@ case PARSE_INDEX_READ_FOOTER:
 		internal->pos -= internal->index_size;
 
 		// See how much memory we can use for decoding this Index.
-		uint64_t memlimit = info->memlimit;
+		memlimit = info->memlimit;
 		internal->memused = sizeof(lzma_index_parser_internal);
 		if (internal->combined_index != NULL) {
 			internal->memused = lzma_index_memused(
@@ -679,7 +687,7 @@ case PARSE_INDEX_READ_STREAM_HEADER:
 			ret = lzma_index_cat(
 					internal->this_index,
 					internal->combined_index,
-					NULL);
+					info->allocator);
 			if (ret != LZMA_OK) {
 				goto error;
 			}
@@ -706,8 +714,8 @@ error:
 	// Something went wrong, free the allocated memory.
 	if (internal) {
 		lzma_end(&internal->strm);
-		lzma_index_end(internal->combined_index, NULL);
-		lzma_index_end(internal->this_index, NULL);
+		lzma_index_end(internal->combined_index, info->allocator);
+		lzma_index_end(internal->this_index, info->allocator);
 		lzma_free(internal, info->allocator);
 	}
 
